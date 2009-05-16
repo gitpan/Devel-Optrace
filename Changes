@@ -1,4 +1,9 @@
 Revision history for Perl extension Devel::Optrace
 
+0.02 Sat May 16 12:01:55 2009
+	- add "-count" option that counts opcodes like -DP
+	- improve performance
+	- fix many bugs
+
 0.01 Tue May 12 22:27:26 2009
         - original version; created by Module::Setup

@@ -27,37 +27,51 @@ typedef struct{
 	SV* debugsv;
 
 	HV* debsv_seen;
-	SV* debf_buff;
 	SV* buff;
 
+	SV* linebuf;
 	PerlIO* log;
 
 	runops_proc_t orig_runops;
 	peep_t        orig_peepp;
+
+	U32* count_data;
+	struct tms start_tms;
 } my_cxt_t;
 START_MY_CXT
 
 #define dMY_DEBUG dMY_CXT; register U32 const debug = (U32)SvUV(MY_CXT.debugsv)
 
-#define DOf_TRACE   0x01
-#define DOf_STACK   0x02
-#define DOf_RUNOPS  0x04
-#define DOf_NOOPT   0x08
-#define DOf_ALL     (DOf_TRACE | DOf_STACK | DOf_RUNOPS)
+#define DOf_TRACE   0x001
+#define DOf_STACK   0x002
+#define DOf_RUNOPS  0x004
+#define DOf_DEFAULT (DOf_TRACE | DOf_STACK | DOf_RUNOPS)
+
+#define DOf_COUNT   0x020 /* very simple opcode counter */
+
+#define DOf_NOOPT   0x100
 
 #define DO_TRACE   (debug & DOf_TRACE)
 #define DO_STACK   (debug & DOf_STACK)
 #define DO_RUNOPS  (debug & DOf_RUNOPS)
 #define DO_NOOPT   (debug & DOf_NOOPT)
+#define DO_COUNT   (debug & DOf_COUNT)
 
 #define PV_LIMIT (50)
+
+#define debflush() STMT_START { \
+		if(SvCUR(MY_CXT.linebuf) > 0){ \
+			PerlIO_write(MY_CXT.log, SvPVX(MY_CXT.linebuf), SvCUR(MY_CXT.linebuf)); \
+			sv_setpvs(MY_CXT.linebuf, ""); \
+		} \
+	} STMT_END
 
 #define debs(s)         do_debpvn(aTHX_ aMY_CXT_ STR_WITH_LEN(s))
 #define debpvn(pv, len) do_debpvn(aTHX_ aMY_CXT_ pv, len)
 static void
 do_debpvn(pTHX_ pMY_CXT_ const char* pv, STRLEN const len){
 	dVAR;
-	PerlIO_write(MY_CXT.log, pv, len);
+	sv_catpvn(MY_CXT.linebuf, pv, len);
 }
 
 #define debpv(pv) do_debpv(aTHX_ aMY_CXT_ pv)
@@ -85,19 +99,19 @@ do_debf_nocontext(const char* const fmt, ...){
 	va_list args;
 
 	va_start(args, fmt);
-	sv_vsetpvf(MY_CXT.debf_buff, fmt, &args);
+	sv_vcatpvf(MY_CXT.linebuf, fmt, &args);
 	va_end(args);
-
-	debsv_simple(MY_CXT.debf_buff);
 }
 
 
 #define debgv(gv, prefix) do_debgv(aTHX_ aMY_CXT_ gv, prefix)
 static void
 do_debgv(pTHX_ pMY_CXT_ GV* const gv, const char* const prefix){
+	dVAR;
 	SV* const dsv = MY_CXT.buff;
 	const char* pv;
 	I32 i, len;
+
 	gv_efullname4(dsv, gv, prefix, FALSE);
 
 	pv  = SvPVX(dsv);
@@ -157,7 +171,7 @@ do_magic_name(const char mgtype){
 		{ PERL_MAGIC_envelem,        "envelem" },
 		{ PERL_MAGIC_fm,             "fm" },
 		{ PERL_MAGIC_regex_global,   "regex_global" },
-#ifdef PERL_MAGIC_hintelem
+#ifdef PERL_MAGIC_hintselem
 		{ PERL_MAGIC_hintselem,      "hintselem" },
 #endif
 		{ PERL_MAGIC_isaelem,        "isaelem" },
@@ -190,12 +204,21 @@ do_magic_name(const char mgtype){
 	return form("unknown(%c)", mgtype);
 }
 
-#define debsv_impl(sv) do_debsv_impl(aTHX_ aMY_CXT_ seen, sv)
+#define debsv_peek(sv) do_debsv_peek(aTHX_ aMY_CXT_ seen, sv)
 static void
-do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
+do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 	dVAR;
 	SV* const buff = MY_CXT.buff;
 	HE* he;
+
+	if(!sv){
+		debs("NULL");
+		return;
+	}
+	if(SvTYPE(sv) > SVt_PVIO){
+		debf("0x%p", sv); /* non-sv pointer (e.g. OP* for pp_pushre()) */
+		return;
+	}
 
 	SvGETMAGIC(sv);
 
@@ -224,7 +247,7 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 		}
 		else{
 			debs("\\");
-			debsv_impl(rv);
+			debsv_peek(rv);
 		}
 		goto finish;
 	}
@@ -242,10 +265,6 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 			debs("NO");
 			return;
 		}
-		else if(sv == &PL_sv_placeholder){
-			debs("PLACEHOLDER");
-			return;
-		}
 	}
 
 	if(SvTYPE(sv) == SVt_PVAV){
@@ -253,7 +272,7 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 		I32 i;
 		debs("@(");
 		for(i = 0; i < len; i++){
-			debsv_impl(AvARRAY((AV*)sv)[i]);
+			debsv_peek(AvARRAY((AV*)sv)[i]);
 
 			if((i+1) < len){
 				debs(",");
@@ -262,31 +281,31 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 		debs(")");
 	}
 	else if(SvTYPE(sv) == SVt_PVHV){
-		char* key;
-		I32 keylen;
-		SV* val;
-		SV* const dsv = newSV(PV_LIMIT);
-		bool first = TRUE;
-
-		debs("%(");
-
-		hv_iterinit((HV*)sv);
-		while((val = hv_iternextsv((HV*)sv, &key, &keylen))){
-			if(!first){
-				debs(",");
+		if(SvMAGICAL(sv)){
+			if(mg_find(sv, PERL_MAGIC_env)){
+				debs("%ENV");
+				goto finish;
 			}
-			else{
-				first = FALSE;
+			else if(mg_find(sv, PERL_MAGIC_sig)){
+				debs("%SIG");
+				goto finish;
 			}
-			pv_pretty(dsv, key, keylen, PV_LIMIT, NULL, NULL, PERL_PV_PRETTY_DUMP);
-			debsv_simple(dsv);
-			debs("=>");
-			debsv_impl(val);
 		}
 
-		debs(")");
-
-		SvREFCNT_dec(dsv);
+		if(HvNAME((HV*)sv)){ /* stash */
+			debs("%");
+			debpv(HvNAME((HV*)sv));
+			debs("::");
+		}
+		else if(sv == (SV*)GvHV(PL_hintgv)){
+			debs("%^H");
+		}
+		else if(sv == (SV*)GvHV(PL_incgv)){
+			debs("%INC");
+		}
+		else{
+			debf("%(%d/%d 0x%p)", (int)HvFILL((HV*)sv), (int)HvMAX((HV*)sv) + 1, sv);
+		}
 	}
 	else if(SvTYPE(sv) == SVt_PVCV || SvTYPE(sv) == SVt_PVFM){
 		debgv(CvGV((CV*)sv), "&");
@@ -299,10 +318,7 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 		debf("IO(%c 0x%p)", IoTYPE((IO*)sv), fp);
 	}
 	else{ /* scalar value */
-		if(!SvOK(sv)){
-			debs("undef");
-		}
-		else if(SvPOKp(sv)){
+		if(SvPOKp(sv)){
 			pv_pretty(buff, SvPVX(sv), SvCUR(sv), PV_LIMIT, NULL, NULL, PERL_PV_PRETTY_DUMP);
 			debsv_simple(buff);
 		}
@@ -318,12 +334,15 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 			debf("%"NVgf, SvNVX(sv));
 		}
 		else{
-			sv_dump(sv);
-			croak("panic: unknown scalar value");
+			debs("undef");
 		}
 	}
 
 	finish:
+	if(SvTYPE(sv) == SVt_PVLV){
+		debf(" LV(%c)", LvTYPE(sv));
+	}
+
 	if(SvMAGICAL(sv)){
 		MAGIC* mg;
 
@@ -341,24 +360,24 @@ do_debsv_impl(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 #define debsv(sv) do_debsv(aTHX_ aMY_CXT_ sv)
 static void
 do_debsv(pTHX_ pMY_CXT_ SV* const sv){
+	dVAR;
 	HV* const seen = MY_CXT.debsv_seen;
-	debsv_impl(sv);
+	debsv_peek(sv);
 	hv_clear(seen);
 }
 
 static void
 do_stack(pTHX_ pMY_CXT){
 	dVAR;
-	I32 i = cxstack_ix + 1;
 	SV** svp = PL_stack_base + 1;
 	SV** end = PL_stack_sp + 1;
+	int i;
 
-	while(--i >= 0){
+	for(i = cxstack_ix; i >= 0; i--){
 		debs(" ");
 	}
 
 	debs("(");
-
 	while(svp != end){
 		debsv(*svp);
 
@@ -368,52 +387,51 @@ do_stack(pTHX_ pMY_CXT){
 			debs(",");
 		}
 	}
-
 	debs(")\n");
-}
-
-/* stolen from dump.c */
-#define deb_curcv(ix) S_deb_curcv(aTHX_ ix)
-static CV*
-S_deb_curcv(pTHX_ const I32 ix)
-{
-    dVAR;
-    const PERL_CONTEXT * const cx = &cxstack[ix];
-
-    if (CxTYPE(cx) == CXt_SUB || CxTYPE(cx) == CXt_FORMAT)
-        return cx->blk_sub.cv;
-    else if (CxTYPE(cx) == CXt_EVAL && !CxTRYBLOCK(cx))
-        return PL_compcv;
-    else if (ix == 0 && PL_curstackinfo->si_type == PERLSI_MAIN)
-        return PL_main_cv;
-    else if (ix <= 0)
-        return NULL;
-    else
-        return deb_curcv(ix - 1);
 }
 
 #define debpadname(po) do_debpadname(aTHX_ aMY_CXT_ (po))
 static void
 do_debpadname(pTHX_ pMY_CXT_ PADOFFSET const targ){
-	CV* const cv = deb_curcv(cxstack_ix);
-	if(cv){
-		SV** const comppad_name = AvARRAY(AvARRAY(CvPADLIST(cv))[0]);
-		debsv_simple(comppad_name[targ]);
-	}
-	else{
-		debf("#%u", (unsigned)targ);
-	}
+	dVAR;
+	CV* const cv = Perl_find_runcv(aTHX_ NULL);
+	AV* const comppad_names = (AV*)AvARRAY(CvPADLIST(cv))[0];
+	SV* name;
+
+	assert(SvTYPE(comppad_names) == SVt_PVAV);
+	assert(AvMAX(comppad_names) >= (I32)targ);
+	name = AvARRAY(comppad_names)[targ];
+
+	assert(SvPOKp(name));
+	debpv(SvPVX(name));
 }
 
-#define Private(flag, name) STMT_START{ if(o->op_private & (flag)){ debs(name); } } STMT_END
+
+static const char*
+S_basename(const char* path){
+	const char* file = path;
+	while(*path){
+		if(*path == '/'){
+			file = ++path;
+		}
+		else{
+			path++;
+		}
+	}
+	return file;
+}
+
+#define Private(flag, name) STMT_START{ if(private & (flag)){ debs(name); } } STMT_END
 
 static void
 do_optrace(pTHX_ pMY_CXT){
 	dVAR;
 	const OP* const o = PL_op;
-	int i = cxstack_ix + 1;
+	int const flags   = o->op_flags;
+	int const private = o->op_private;
+	int i;
 
-	while(--i >= 0){
+	for(i = cxstack_ix; i >= 0; i--){
 		debs(" ");
 	}
 
@@ -422,10 +440,18 @@ do_optrace(pTHX_ pMY_CXT){
 	switch(o->op_type){
 	case OP_NEXTSTATE:
 	case OP_DBSTATE:
-		debf("(%s%s %s:%d)",
-			CopLABEL(cCOPo) ? CopLABEL(cCOPo) : "",
-			CopSTASHPV(cCOPo),
-			CopFILE(cCOPo), (int)CopLINE(cCOPo));
+		if(CopFILE(cCOPo)[0] == '/'){ /* absolute path */
+			debf("(%s%s /.../%s:%d)",
+				CopLABEL(cCOPo) ? CopLABEL(cCOPo) : "",
+				CopSTASHPV(cCOPo),
+				S_basename(CopFILE(cCOPo)), (int)CopLINE(cCOPo));
+		}
+		else{
+			debf("(%s%s %s:%d)",
+				CopLABEL(cCOPo) ? CopLABEL(cCOPo) : "",
+				CopSTASHPV(cCOPo),
+				CopFILE(cCOPo), (int)CopLINE(cCOPo));
+		}
 		break;
 
 	case OP_CONST:
@@ -446,25 +472,34 @@ do_optrace(pTHX_ pMY_CXT){
 		break;
 
 	case OP_GV:
+		debs("(");
+		debgv(cGVOPo_gv, "*");
+		debs(")");
+		Private(OPpEARLY_CV, " EARLY_CV");
+		goto intro_common;
+
 	case OP_GVSV:
 		debs("(");
-		debgv(cGVOPo_gv, (o->op_type == OP_GVSV ? "$" : "*"));
+		debgv(cGVOPo_gv, "$");
 		debs(")");
+		goto intro_common;
 
-		if(o->op_type == OP_GV){
-			Private(OPpEARLY_CV, " EARLY_CV");
-			break;
-		}
+	case OP_RV2GV:
+#ifdef OPpDONT_INIT_GV
+		Private(OPpDONT_INIT_GV, " DONT_INIT_GV");
+#endif
+		goto intro_common;
 
-		/* fall through */
 	case OP_RV2SV:
 	case OP_RV2AV:
 	case OP_RV2HV:
-
-		Private(OPpLVAL_INTRO, " LVAL_INTRO");
 		Private(OPpOUR_INTRO,  " OUR_INTRO");
-		Private(OPpDEREF,      " DEREF");
-		break;
+		goto intro_common;
+
+	case OP_AELEM:
+	case OP_HELEM:
+		Private(OPpLVAL_DEFER,  " LVAL_DEFER");
+		goto intro_common;
 
 	case OP_PADSV:
 	case OP_PADAV:
@@ -473,29 +508,26 @@ do_optrace(pTHX_ pMY_CXT){
 		debpadname(o->op_targ);
 		debs(")");
 
-		Private(OPpLVAL_INTRO, " LVAL_INTRO");
 #ifdef OPpPAD_STATE
 		Private(OPpPAD_STATE,  " STATE");
 #endif
+
+		intro_common:
+		Private(OPpLVAL_INTRO, " LVAL_INTRO");
 		Private(OPpDEREF,      " DEREF");
+		Private(OPpMAYBE_LVSUB," MAYBE_LVSUB");
 
 		break;
 
 	case OP_AELEMFAST:
 		debs("(");
-		if(o->op_flags & OPf_SPECIAL){
+		if(flags & OPf_SPECIAL){
 			debpadname(o->op_targ);
 		}
 		else{
 			debgv(cGVOPo_gv, "@");
 		}
-		debf("[%d])", (int)o->op_private);
-		break;
-
-	case OP_AELEM:
-	case OP_HELEM:
-		Private(OPpLVAL_INTRO, " LVAL_INTRO");
-		Private(OPpDEREF,      " DEREF");
+		debf("[%d])", private);
 		break;
 
 	case OP_ENTERITER:
@@ -563,41 +595,80 @@ do_optrace(pTHX_ pMY_CXT){
 	}
 
 	/* flags */
-	if((o->op_flags & OPf_WANT) == OPf_WANT_VOID){
+	switch(flags & OPf_WANT){
+	case OPf_WANT_VOID:
 		debs(" VOID");
-	}
-	else if((o->op_flags & OPf_WANT) == OPf_WANT_SCALAR){
+		break;
+	case OPf_WANT_SCALAR:
 		debs(" SCALAR");
-	}
-	else if((o->op_flags & OPf_WANT) == OPf_WANT_LIST){
+		break;
+	case OPf_WANT_LIST:
 		debs(" LIST");
+		break;
 	}
 
-	if(o->op_flags & OPf_KIDS){
+	if(flags & OPf_KIDS){
 		debs(" KIDS");
 	}
-	if(o->op_flags & OPf_PARENS){
+	if(flags & OPf_PARENS){
 		debs(" PARENS");
 	}
-	if(o->op_flags & OPf_REF){
+	if(flags & OPf_REF){
 		debs(" REF");
 	}
-	if(o->op_flags & OPf_MOD){
+	if(flags & OPf_MOD){
 		debs(" MOD");
 	}
-	if(o->op_flags & OPf_STACKED){
+	if(flags & OPf_STACKED){
 		debs(" STACKED");
 	}
-	if(o->op_flags & OPf_SPECIAL){
+	if(flags & OPf_SPECIAL){
 		debs(" SPECIAL");
 	}
 
 	debs("\n");
 }
 
+static void
+do_debcount(pTHX_ pMY_CXT_ const OP* const o){
+	dVAR;
+	if(!MY_CXT.count_data){
+		Newxz(MY_CXT.count_data, MAXO, U32);
+
+		PerlProc_times(&(MY_CXT.start_tms));
+	}
+	MY_CXT.count_data[o->op_type]++;
+}
+
+static void
+do_debcount_dump(pTHX_ pMY_CXT){
+	struct tms end_tms;
+	int i;
+
+	if(!MY_CXT.count_data){
+		return;
+	}
+
+	PerlProc_times(&end_tms);
+
+	/* dump count_data */
+	debf(">> name                times    (user=%.03"NVff" system=%.03"NVff")\n",
+		(NV)(end_tms.tms_utime - MY_CXT.start_tms.tms_utime) / (NV)PL_clocktick,
+		(NV)(end_tms.tms_stime - MY_CXT.start_tms.tms_stime) / (NV)PL_clocktick
+	);
+	for(i = 0; i < MAXO; i++){
+		if(MY_CXT.count_data[i] > 0){
+			debf(">> %-18s %8u\n",
+				PL_op_name[i],
+				(unsigned)MY_CXT.count_data[i]
+			);
+			debflush();
+		}
+	}
+}
+
 static int
-d_optrace_runops(pTHX)
-{
+d_optrace_runops(pTHX){
 	dVAR;
 	dMY_DEBUG;
 
@@ -614,6 +685,11 @@ d_optrace_runops(pTHX)
 		if(DO_TRACE){
 			do_optrace(aTHX_ aMY_CXT);
 		}
+		if(DO_COUNT){
+			do_debcount(aTHX_ aMY_CXT_ PL_op);
+		}
+
+		debflush();
 	}
 	while((PL_op = CALL_FPTR(PL_op->op_ppaddr)(aTHX)));
 
@@ -624,6 +700,8 @@ d_optrace_runops(pTHX)
 	if(DO_RUNOPS){
 		debf("Leaving RUNOPS (%s:%d)\n", CopFILE(PL_curcop), (int)CopLINE(PL_curcop));
 	}
+
+	debflush();
 
 	TAINT_NOT;
 	return 0;
@@ -668,8 +746,10 @@ BOOT:
 
 	MY_CXT.log        = Perl_error_log;
 	MY_CXT.buff       = newSV(50);
-	MY_CXT.debf_buff  = newSV(50);
+	MY_CXT.linebuf    = newSV(50);
 	MY_CXT.debsv_seen = newHV();
+
+	sv_setpvs(MY_CXT.linebuf, "");
 
 	MY_CXT.orig_runops = PL_runops;
 	MY_CXT.orig_peepp  = PL_peepp;
@@ -682,14 +762,24 @@ BOOT:
 	newCONSTSUB(stash, "DOf_STACK",   newSViv(DOf_STACK));
 	newCONSTSUB(stash, "DOf_RUNOPS",  newSViv(DOf_RUNOPS));
 	newCONSTSUB(stash, "DOf_NOOPT",   newSViv(DOf_NOOPT));
+	newCONSTSUB(stash, "DOf_COUNT",   newSViv(DOf_COUNT));
 
-	newCONSTSUB(stash, "DOf_ALL",     newSViv(DOf_ALL));
+	newCONSTSUB(stash, "DOf_DEFAULT",     newSViv(DOf_DEFAULT));
 
 	PL_runops = d_optrace_runops;
 	PL_peepp  = d_optrace_peep;
 }
 
 PROTOTYPES: DISABLE
+
+void
+END()
+CODE:
+{
+	dMY_CXT;
+	do_debcount_dump(aTHX_ aMY_CXT);
+}
+
 
 void
 p(...)
@@ -699,6 +789,7 @@ CODE:
 	while(MARK != SP){
 		debsv(*(++MARK));
 		debs("\n");
+		debflush();
 	}
 	PERL_UNUSED_VAR(items);
 }

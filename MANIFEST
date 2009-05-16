@@ -6,6 +6,7 @@ example/helem.pl
 example/list_util.pl
 example/p.pl
 example/print.pl
+example/split.pl
 inc/Module/Install.pm
 inc/Module/Install/AuthorTests.pm
 inc/Module/Install/Base.pm

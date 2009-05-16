@@ -6,10 +6,12 @@ use 5.008_001;
 
 
 BEGIN{
-	our $VERSION = '0.01';
+	our $VERSION = '0.02';
 
 	require XSLoader;
 	XSLoader::load(__PACKAGE__, $VERSION);
+
+	$^H |= 0x600; # use strict qw(subs vars);
 }
 
 our @EXPORT = qw(p);
@@ -21,8 +23,9 @@ my %bits = (
 	-stack   => DOf_STACK,
 	-runops  => DOf_RUNOPS,
 	-noopt   => DOf_NOOPT,
+	-count   => DOf_COUNT,
 
-	-all     => DOf_ALL,
+	-all     => DOf_DEFAULT,
 );
 
 
@@ -73,7 +76,7 @@ Devel::Optrace - Traces opcodes which are running now
 
 =head1 VERSION
 
-This document describes Devel::Optrace version 0.01.
+This document describes Devel::Optrace version 0.02.
 
 =head1 SYNOPSIS
 
