@@ -1,12 +1,19 @@
 Changes
 example/aelem.pl
+example/attr.pl
+example/warnhook.pl
 example/foreach.pl
 example/funcall.pl
+example/grep.pl
 example/helem.pl
 example/list_util.pl
+example/open.pl
 example/p.pl
 example/print.pl
+example/rx.pl
+example/sort.pl
 example/split.pl
+example/tie.pl
 inc/Module/Install.pm
 inc/Module/Install/AuthorTests.pm
 inc/Module/Install/Base.pm
@@ -22,6 +29,7 @@ Optrace.xs
 ppport.h
 README
 t/00_load.t
+t/01_trace.t
 xt/01_podspell.t
 xt/02_pod.t
 xt/03_pod-coverage.t

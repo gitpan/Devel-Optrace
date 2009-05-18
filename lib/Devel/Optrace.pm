@@ -4,9 +4,8 @@ use 5.008_001;
 #use strict;
 #use warnings;
 
-
 BEGIN{
-	our $VERSION = '0.02';
+	our $VERSION = '0.03';
 
 	require XSLoader;
 	XSLoader::load(__PACKAGE__, $VERSION);
@@ -14,14 +13,13 @@ BEGIN{
 	$^H |= 0x600; # use strict qw(subs vars);
 }
 
-our @EXPORT = qw(p);
-
 our $DB; # tracing flags
 
 my %bits = (
 	-trace   => DOf_TRACE,
 	-stack   => DOf_STACK,
 	-runops  => DOf_RUNOPS,
+
 	-noopt   => DOf_NOOPT,
 	-count   => DOf_COUNT,
 
@@ -45,6 +43,13 @@ sub import{
 	#no strict 'refs';
 	*{caller() . '::p'} = \&p;
 	return;
+}
+
+sub enable{
+	$DB |=  DOf_DEFAULT;
+}
+sub disable{
+	$DB &= ~DOf_DEFAULT;
 }
 
 sub set{
@@ -76,14 +81,14 @@ Devel::Optrace - Traces opcodes which are running now
 
 =head1 VERSION
 
-This document describes Devel::Optrace version 0.02.
+This document describes Devel::Optrace version 0.03.
 
 =head1 SYNOPSIS
 
 	use Devel::Optrace;
-	Devel::Optrace->set(-all => 1); # enables -trace, -stack and -runops
+	Devel::Optrace->enable();  # enables  -trace, -stack and -runops
 	# ...
-	Devel::Optrace->set(-all => 0); # disables -trace, stack and -runops
+	Devel::Optrace->disable(); # disables -trace, -stack and -runops
 
 	# or command line:
 	# $ perl -MDevel::Optrace=-all -e '...'  # normal way
@@ -94,7 +99,7 @@ This document describes Devel::Optrace version 0.02.
 
 Devel::Optrace is an opcode debugger which traces opcodes and stacks.
 
-There are three trace options:
+There are several trace options:
 
 =over 4
 
@@ -103,21 +108,35 @@ There are three trace options:
 Traces opcodes like perl's C<-Dt>, reporting
 C<"$opcode @op_private @op_flags"> or C<"$opcode(@op_data) @op_private @op_flags">.
 
+The indent level indicates the depth of the context stacks.
+
 =item -stack
 
 Dumps the perl stack (C<PL_stack>) like perl's C<-Ds>.
 
 =item -runops
 
-Traces C<runops> levels.
+Traces C<runops> levels with the current stack info type (MAIN, OVERLOAD, DESTROY, etc.).
+
+=item -all
+
+Sets C<-trace>, C<-stack> and C<-runops> on/off.
+
+=item -count
+
+Counts and reports opcodes executed.
+
+=item -noopt
+
+Disable the peephole optimizer.
 
 =back
 
 =head1 EXAMPLES
 
-C<< perl -d:Optrace -e 'print qq{Hello, @_ world!\n}' >>:
+C<< perl -d:Optrace -e 'print qq{Hello, @ARGV world!\n}' Perl >>:
 
-	Entering RUNOPS (-e:0)
+	Entering RUNOPS MAIN (-e:0)
 	()
 	enter
 	 ()
@@ -131,23 +150,26 @@ C<< perl -d:Optrace -e 'print qq{Hello, @_ world!\n}' >>:
 	 ("Hello, ")
 	 gvsv($") SCALAR
 	 ("Hello, "," ")
-	 gv(*_) SCALAR
-	 ("Hello, "," ",*_)
+	 gv(*ARGV) SCALAR
+	 ("Hello, "," ",*ARGV)
 	 rv2av LIST KIDS
-	 ("Hello, "," ")
+	 ("Hello, "," ","Perl")
 	 join SCALAR KIDS
-	 ("Hello, ","")
+	 ("Hello, ","Perl")
 	 concat SCALAR KIDS
-	 ("Hello, ")
+	 ("Hello, Perl")
 	 const(" world!\n") SCALAR
-	 ("Hello, "," world!\n")
+	 ("Hello, Perl"," world!\n")
 	 concat SCALAR KIDS STACKED
-	 ("Hello,  world!\n")
+	 ("Hello, Perl world!\n")
 	 print VOID KIDS
 	 (YES)
 	 leave VOID KIDS PARENS
 	()
-	Leaving RUNOPS (-e:0)
+	Leaving RUNOPS MAIN (-e:0)
+
+This reveals that the perl code C<< print qq{Hello, @ARGV world!\n} >> is
+interpreted as C<< print qq{Hello, } . join($", @ARGV) . qq{ world!\n} >>.
 
 =head1 DEPENDENCIES
 

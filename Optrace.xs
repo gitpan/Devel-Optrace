@@ -3,13 +3,10 @@
 #include <perl.h>
 #include <XSUB.h>
 
-#define NEED_pv_pretty
-#define NEED_pv_escape
-#define NEED_my_snprintf
 #include "ppport.h"
 
 #ifndef SvRXOK
-#define SvRXOK(sv) (SvROK(sv) && mg_find(SvRV(sv), PERL_MAGIC_qr))
+#define SvRXOK(sv) (SvROK(sv) && SvMAGICAL(SvRV(sv)) && mg_find(SvRV(sv), PERL_MAGIC_qr))
 #endif
 
 #ifndef gv_stashpvs
@@ -30,7 +27,6 @@ typedef struct{
 	SV* buff;
 
 	SV* linebuf;
-	PerlIO* log;
 
 	runops_proc_t orig_runops;
 	peep_t        orig_peepp;
@@ -40,14 +36,14 @@ typedef struct{
 } my_cxt_t;
 START_MY_CXT
 
-#define dMY_DEBUG dMY_CXT; register U32 const debug = (U32)SvUV(MY_CXT.debugsv)
+#define dMY_DEBUG dMY_CXT; register unsigned int const debug = (unsigned int)SvUV(MY_CXT.debugsv)
 
 #define DOf_TRACE   0x001
 #define DOf_STACK   0x002
 #define DOf_RUNOPS  0x004
 #define DOf_DEFAULT (DOf_TRACE | DOf_STACK | DOf_RUNOPS)
 
-#define DOf_COUNT   0x020 /* very simple opcode counter */
+#define DOf_COUNT   0x020 /* simple opcode counter */
 
 #define DOf_NOOPT   0x100
 
@@ -61,8 +57,10 @@ START_MY_CXT
 
 #define debflush() STMT_START { \
 		if(SvCUR(MY_CXT.linebuf) > 0){ \
-			PerlIO_write(MY_CXT.log, SvPVX(MY_CXT.linebuf), SvCUR(MY_CXT.linebuf)); \
-			sv_setpvs(MY_CXT.linebuf, ""); \
+			GV* const stderrgv = PL_stderrgv;\
+			PerlIO* const log  = isGV(stderrgv) && GvIOp(stderrgv) ? IoOFP(GvIOp(stderrgv)) : NULL; \
+			PerlIO_write(log, SvPVX(MY_CXT.linebuf), SvCUR(MY_CXT.linebuf)); \
+			SvCUR_set(MY_CXT.linebuf, 0); \
 		} \
 	} STMT_END
 
@@ -78,16 +76,7 @@ do_debpvn(pTHX_ pMY_CXT_ const char* pv, STRLEN const len){
 static void
 do_debpv(pTHX_ pMY_CXT_ const char* const pv){
 	dVAR;
-	debpvn(pv, strlen(pv));
-}
-
-#define debsv_simple(sv) do_debsv_simple(aTHX_ aMY_CXT_ sv)
-static void
-do_debsv_simple(pTHX_ pMY_CXT_ SV* const sv){
-	dVAR;
-	STRLEN len;
-	const char* const pv = SvPV_const(sv, len);
-	debpvn(pv, len);
+	sv_catpvn(MY_CXT.linebuf, pv, strlen(pv));
 }
 
 
@@ -103,38 +92,38 @@ do_debf_nocontext(const char* const fmt, ...){
 	va_end(args);
 }
 
-
-#define debgv(gv, prefix) do_debgv(aTHX_ aMY_CXT_ gv, prefix)
+#define debname(pv, len) do_debname(aTHX_ aMY_CXT_ pv, len)
 static void
-do_debgv(pTHX_ pMY_CXT_ GV* const gv, const char* const prefix){
+do_debname(pTHX_ pMY_CXT_ const char* const pv, STRLEN const len){
 	dVAR;
-	SV* const dsv = MY_CXT.buff;
-	const char* pv;
-	I32 i, len;
+	STRLEN i;
 
-	gv_efullname4(dsv, gv, prefix, FALSE);
-
-	pv  = SvPVX(dsv);
-	len = SvCUR(dsv);
 	for(i = 0; i < len; i++){
 		if(isCNTRL(pv[i])){
 			char ctrl[2];
 			ctrl[0] = '^';
 			ctrl[1] = toCTRL(pv[i]);
 
-			sv_insert(dsv, i, 1, ctrl, 2);
-
-			pv  = SvPVX(dsv);
-			len = SvCUR(dsv);
+			debpvn(ctrl, 2);
+		}
+		else{
+			debpvn(pv+i, 1);
 		}
 	}
-	debpvn(pv, len);
+}
+
+#define debgv(gv, prefix) do_debgv(aTHX_ aMY_CXT_ gv, prefix)
+static void
+do_debgv(pTHX_ pMY_CXT_ GV* const gv, const char* const prefix){
+	dVAR;
+	gv_efullname4(MY_CXT.buff, gv, prefix, FALSE);
+	debname(SvPVX(MY_CXT.buff), SvCUR(MY_CXT.buff));
 }
 
 static const char*
 do_magic_name(const char mgtype){
 	/* stolen from dump.c */
-	static const struct { const char type; const char *name; } magic_names[] = {
+	static const struct { const char type; const char* const name; } magic_names[] = {
 		{ PERL_MAGIC_sv,             "sv" },
 		{ PERL_MAGIC_arylen,         "arylen" },
 		{ PERL_MAGIC_glob,           "glob" },
@@ -211,6 +200,7 @@ do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 	SV* const buff = MY_CXT.buff;
 	HE* he;
 
+	retry:
 	if(!sv){
 		debs("NULL");
 		return;
@@ -219,8 +209,6 @@ do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 		debf("0x%p", sv); /* non-sv pointer (e.g. OP* for pp_pushre()) */
 		return;
 	}
-
-	SvGETMAGIC(sv);
 
 	sv_setuv(buff, PTR2UV(sv));
 	he = hv_fetch_ent(seen, buff, TRUE, 0U);
@@ -233,23 +221,23 @@ do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 	if(SvROK(sv)){
 		SV* const rv = SvRV(sv);
 		if(SvOBJECT(rv)){
-			if(SvAMAGIC(sv)){
-				debf("%s=%s(0x%p)", sv_reftype(rv, TRUE), sv_reftype(rv, FALSE), rv);
-			}
-			else if(SvRXOK(sv)){
+			if(SvRXOK(sv)){
+				STRLEN len;
+				const char* const pv = SvPV_const(sv, len);
 				debs("qr/");
-				debsv_simple(sv);
+				debpvn(pv, len);
 				debs("/");
 			}
 			else{
-				debsv_simple(sv);
+				debf("%s=%s(0x%p)", sv_reftype(rv, TRUE), sv_reftype(rv, FALSE), rv);
 			}
+			goto finish;
 		}
 		else{
 			debs("\\");
-			debsv_peek(rv);
+			sv = rv;
+			goto retry;
 		}
-		goto finish;
 	}
 
 	if(SvREADONLY(sv)){
@@ -265,9 +253,22 @@ do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 			debs("NO");
 			return;
 		}
+		else if(sv == &PL_sv_placeholder){
+			debs("PLACEHOLDER");
+			return;
+		}
 	}
 
-	if(SvTYPE(sv) == SVt_PVAV){
+	switch(SvTYPE(sv)){
+	case SVt_PVAV:{
+		debs("@");
+		if(sv == (SV*)GvAV(PL_defgv)){
+			debs("_");
+		}
+		else{
+			debf("(%d/%d 0x%p)", AvFILLp((AV*)sv)+1, AvMAX((AV*)sv)+1, sv);
+		}
+#if 0
 		I32 const len = AvFILLp((AV*)sv) + 1;
 		I32 i;
 		debs("@(");
@@ -279,48 +280,67 @@ do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 			}
 		}
 		debs(")");
+#endif
+		break;
 	}
-	else if(SvTYPE(sv) == SVt_PVHV){
+	case SVt_PVHV:{
+		debs("%");
+
 		if(SvMAGICAL(sv)){
 			if(mg_find(sv, PERL_MAGIC_env)){
-				debs("%ENV");
+				debs("ENV");
 				goto finish;
 			}
 			else if(mg_find(sv, PERL_MAGIC_sig)){
-				debs("%SIG");
+				debs("SIG");
 				goto finish;
 			}
 		}
 
 		if(HvNAME((HV*)sv)){ /* stash */
-			debs("%");
 			debpv(HvNAME((HV*)sv));
 			debs("::");
 		}
 		else if(sv == (SV*)GvHV(PL_hintgv)){
-			debs("%^H");
+			debs("^H");
 		}
 		else if(sv == (SV*)GvHV(PL_incgv)){
-			debs("%INC");
+			debs("INC");
 		}
 		else{
-			debf("%(%d/%d 0x%p)", (int)HvFILL((HV*)sv), (int)HvMAX((HV*)sv) + 1, sv);
+			debf("(%d/%d 0x%p)", (int)HvFILL((HV*)sv), (int)HvMAX((HV*)sv) + 1, sv);
 		}
+		break;
 	}
-	else if(SvTYPE(sv) == SVt_PVCV || SvTYPE(sv) == SVt_PVFM){
-		debgv(CvGV((CV*)sv), "&");
+	case SVt_PVCV:
+	case SVt_PVFM:{
+		if(CvGV((CV*)sv)){
+			debgv(CvGV((CV*)sv), "&");
+		}
+		else{
+			debs("&(unknown)");
+		}
+		break;
 	}
-	else if(SvTYPE(sv) == SVt_PVGV){
+	case SVt_PVGV:{
 		debgv((GV*)sv, "*");
+		break;
 	}
-	else if(SvTYPE(sv) == SVt_PVIO){
+	case SVt_PVIO:{
 		const PerlIO* const fp = IoIFP((IO*)sv);
 		debf("IO(%c 0x%p)", IoTYPE((IO*)sv), fp);
+		break;
 	}
-	else{ /* scalar value */
+
+	/* scalar */
+	case SVt_NULL:{
+		debs("undef");
+		break;
+	}
+	default:
 		if(SvPOKp(sv)){
-			pv_pretty(buff, SvPVX(sv), SvCUR(sv), PV_LIMIT, NULL, NULL, PERL_PV_PRETTY_DUMP);
-			debsv_simple(buff);
+			pv_display(buff, SvPVX(sv), SvCUR(sv), SvCUR(sv), PV_LIMIT);
+			debpvn(SvPVX(buff), SvCUR(buff));
 		}
 		else if(SvIOKp(sv)){
 			if(SvIsUV(sv)){
@@ -336,24 +356,69 @@ do_debsv_peek(pTHX_ pMY_CXT_ HV* const seen, SV* sv){
 		else{
 			debs("undef");
 		}
-	}
+
+		if(SvTYPE(sv) == SVt_PVLV){
+			debs(" LV(");
+			switch(LvTYPE(sv)){
+			case 'k':
+				debs("keys");
+				break;
+			case '.':
+				debs("pos");
+				break;
+			case 'x':
+				debs("substr");
+				break;
+			case 'v':
+				debs("vec");
+				break;
+			case '/':
+				debs("re"); /* split/pushre */
+				break;
+			case 'y':
+				debs("elem"); /* aelem/helem/iter */
+				break;
+			case 't':
+				debs("tie");
+				break;
+			case 'T':
+				debs("tiedelem");
+				break;
+			default:
+				debf("%c", LvTYPE(sv));
+			}
+			debs(")");
+		}
+	} /* switch(SvTYPE(sv)) */
 
 	finish:
-	if(SvTYPE(sv) == SVt_PVLV){
-		debf(" LV(%c)", LvTYPE(sv));
-	}
-
 	if(SvMAGICAL(sv)){
 		MAGIC* mg;
 
-		debs(" MG(");
 		for(mg = SvMAGIC(sv); mg; mg = mg->mg_moremagic){
+			debs(" MG(");
 			debpv(do_magic_name(mg->mg_type));
-			if(mg->mg_moremagic){
-				debs(",");
+
+			switch(mg->mg_type){
+			case PERL_MAGIC_sv:
+				debs(" ");
+				debgv((GV*)mg->mg_obj, "$");
+				break;
+			case PERL_MAGIC_isa:
+				debs(" ");
+				debgv((GV*)mg->mg_obj, "@");
+				break;
+
+			case PERL_MAGIC_isaelem:
+				break;
+			default:
+				if(mg->mg_obj && sv != mg->mg_obj){
+					debs(" ");
+					debsv_peek(mg->mg_obj);
+				}
 			}
+			debs(")");
 		}
-		debs(")");
 	}
 }
 
@@ -367,22 +432,29 @@ do_debsv(pTHX_ pMY_CXT_ SV* const sv){
 }
 
 static void
+do_debindent(pTHX_ pMY_CXT){
+	dVAR;
+	PERL_SI* si;
+	for(si = PL_curstackinfo; si; si = si->si_prev){
+		int i;
+		for(i = si->si_cxix; i >= 0; i--){
+			debs(" ");
+		}
+	}
+}
+
+static void
 do_stack(pTHX_ pMY_CXT){
 	dVAR;
 	SV** svp = PL_stack_base + 1;
 	SV** end = PL_stack_sp + 1;
-	int i;
 
-	for(i = cxstack_ix; i >= 0; i--){
-		debs(" ");
-	}
+	do_debindent(aTHX_ aMY_CXT);
 
 	debs("(");
 	while(svp != end){
 		debsv(*svp);
-
 		svp++;
-
 		if(svp != end){
 			debs(",");
 		}
@@ -403,22 +475,32 @@ do_debpadname(pTHX_ pMY_CXT_ PADOFFSET const targ){
 	name = AvARRAY(comppad_names)[targ];
 
 	assert(SvPOKp(name));
+#if PERL_BCDVERSION >= 0x5010000
+	debpvn(SvPVX(name), SvCUR(name));
+#else
 	debpv(SvPVX(name));
+#endif
 }
 
 
+#define CopFILE_short(cop) do_shortname(aTHX_ CopFILE(cop))
 static const char*
-S_basename(const char* path){
-	const char* file = path;
-	while(*path){
-		if(*path == '/'){
-			file = ++path;
+do_shortname(pTHX_ const char* path){
+	if(path[0] == '/'){
+		const char* file = path;
+		while(*path){
+			if(*path == '/'){
+				file = ++path;
+			}
+			else{
+				path++;
+			}
 		}
-		else{
-			path++;
-		}
+		return Perl_form(aTHX_ "/.../%s", file);
 	}
-	return file;
+	else{
+		return path;
+	}
 }
 
 #define Private(flag, name) STMT_START{ if(private & (flag)){ debs(name); } } STMT_END
@@ -429,29 +511,18 @@ do_optrace(pTHX_ pMY_CXT){
 	const OP* const o = PL_op;
 	int const flags   = o->op_flags;
 	int const private = o->op_private;
-	int i;
 
-	for(i = cxstack_ix; i >= 0; i--){
-		debs(" ");
-	}
+	do_debindent(aTHX_ aMY_CXT);
 
-	debpv(OP_NAME((OP*)o)); /* OP_NAME requires OP*, not const OP* */
+	debpv(OP_NAME((OP*)o)); /* OP_NAME may require OP*, not const OP* */
 
 	switch(o->op_type){
 	case OP_NEXTSTATE:
 	case OP_DBSTATE:
-		if(CopFILE(cCOPo)[0] == '/'){ /* absolute path */
-			debf("(%s%s /.../%s:%d)",
-				CopLABEL(cCOPo) ? CopLABEL(cCOPo) : "",
-				CopSTASHPV(cCOPo),
-				S_basename(CopFILE(cCOPo)), (int)CopLINE(cCOPo));
-		}
-		else{
-			debf("(%s%s %s:%d)",
-				CopLABEL(cCOPo) ? CopLABEL(cCOPo) : "",
-				CopSTASHPV(cCOPo),
-				CopFILE(cCOPo), (int)CopLINE(cCOPo));
-		}
+		debf("(%s%s %s:%d)",
+			CopLABEL(cCOPo) ? CopLABEL(cCOPo) : "",
+			CopSTASHPV(cCOPo),
+			CopFILE_short(cCOPo), (int)CopLINE(cCOPo));
 		break;
 
 	case OP_CONST:
@@ -578,11 +649,13 @@ do_optrace(pTHX_ pMY_CXT){
 
 	case OP_METHOD_NAMED:
 		debs("(");
-		debsv_simple(cSVOPo_sv);
+		assert(SvPOKp(cSVOPo_sv));
+		debpvn(SvPVX(cSVOPo_sv), SvCUR(cSVOPo_sv));
 		debs(")");
 		break;
 
 	case OP_TRANS:
+		Private(OPpTARGET_MY,        " TARGET_MY");
 		Private(OPpTRANS_TO_UTF,     " TO_UTF");
 		Private(OPpTRANS_IDENTICAL,  " IDENTICAL");
 		Private(OPpTRANS_SQUASH,     " SQUASH");
@@ -590,6 +663,81 @@ do_optrace(pTHX_ pMY_CXT){
 		Private(OPpTRANS_GROWS,      " GROWS");
 		Private(OPpTRANS_DELETE,     " DELETE");
 		break;
+
+	case OP_MATCH:
+	case OP_SUBST:
+	case OP_SUBSTCONT:
+		Private(OPpTARGET_MY,        " TARGET_MY");
+		Private(OPpRUNTIME, " RUNTIME");
+		break;
+
+	case OP_LEAVESUB:
+	case OP_LEAVESUBLV:
+	case OP_LEAVEEVAL:
+	case OP_LEAVE:
+	case OP_SCOPE:
+	case OP_LEAVEWRITE:
+		Private(OPpREFCOUNTED, " REFCOUNTED");
+		break;
+
+	case OP_REPEAT:
+		Private(OPpREPEAT_DOLIST, " DOLIST");
+		break;
+
+	case OP_FLIP:
+	case OP_FLOP:
+		Private(OPpFLIP_LINENUM, " LINENUM");
+		break;
+
+	case OP_LIST:
+		Private(OPpLIST_GUESSED, " GUESSED");
+		break;
+
+	case OP_DELETE:
+		Private(OPpSLICE, " SLICE");
+		break;
+
+	case OP_EXISTS:
+		Private(OPpEXISTS_SUB, " SUB");
+		break;
+
+	case OP_SORT:
+		Private(OPpSORT_NUMERIC, " NUMERIC");
+		Private(OPpSORT_INTEGER, " INTEGER");
+		Private(OPpSORT_REVERSE, " REVERSE");
+		Private(OPpSORT_INPLACE, " INPLACE");
+		Private(OPpSORT_DESCEND, " DESCEND");
+#ifdef OPpSORT_QSORT
+		Private(OPpSORT_QSORT,   " QSORT");
+#endif
+#ifdef OPpSORT_STABLE
+		Private(OPpSORT_STABLE,  " STABLE");
+#endif
+		break;
+
+	case OP_OPEN:
+	case OP_BACKTICK:
+	Private(OPpOPEN_IN_RAW,   " IN_RAW");
+	Private(OPpOPEN_IN_CRLF,  " IN_CRLF");
+	Private(OPpOPEN_OUT_RAW,  " OUT_RAW");
+	Private(OPpOPEN_OUT_CRLF, " OUT_CRLF");
+	break;
+
+	case OP_GREPSTART:
+	case OP_GREPWHILE:
+	case OP_MAPSTART:
+	case OP_MAPWHILE:
+#ifdef OPpGREP_LEX
+		Private(OPpGREP_LEX, " LEX");
+#endif
+		break;
+
+	case OP_ENTEREVAL:
+#ifdef OPpEVAL_HAS_HH
+		Private(OPpEVAL_HAS_HH, " HAS_HH");
+#endif
+		break;
+
 	default:
 		NOOP;
 	}
@@ -667,13 +815,57 @@ do_debcount_dump(pTHX_ pMY_CXT){
 	}
 }
 
+static void
+do_debstackinfo(pTHX_ pMY_CXT){
+	PERL_SI* const si = PL_curstackinfo;
+
+	switch(si->si_type){
+	default:
+		debs(" UNKNOWN");
+		break;
+	case PERLSI_UNDEF:
+		debs(" UNDEF");
+		break;
+	case PERLSI_MAIN:
+		debs(" MAIN");
+		break;
+	case PERLSI_MAGIC:
+		debs(" MAGIC");
+		break;
+	case PERLSI_SORT:
+		debs(" SORT");
+		break;
+	case PERLSI_SIGNAL:
+		debs(" SIGNAL");
+		break;
+	case PERLSI_OVERLOAD:
+		debs(" OVERLOAD");
+		break;
+	case PERLSI_DESTROY:
+		debs(" DESTROY");
+		break;
+	case PERLSI_WARNHOOK:
+		debs(" WARNHOOK");
+		break;
+	case PERLSI_DIEHOOK:
+		debs(" DIEHOOK");
+		break;
+	case PERLSI_REQUIRE:
+		debs(" REQUIRE");
+		break;
+	}
+}
+
 static int
 d_optrace_runops(pTHX){
 	dVAR;
 	dMY_DEBUG;
 
 	if(DO_RUNOPS){
-		debf("Entering RUNOPS (%s:%d)\n", CopFILE(PL_curcop), (int)CopLINE(PL_curcop));
+		do_debindent(aTHX_ aMY_CXT);
+		debs("Entering RUNOPS");
+		do_debstackinfo(aTHX_ aMY_CXT);
+		debf(" (%s:%d)\n", CopFILE_short(PL_curcop), (int)CopLINE(PL_curcop));
 	}
 
 	do{
@@ -698,7 +890,10 @@ d_optrace_runops(pTHX){
 	}
 
 	if(DO_RUNOPS){
-		debf("Leaving RUNOPS (%s:%d)\n", CopFILE(PL_curcop), (int)CopLINE(PL_curcop));
+		do_debindent(aTHX_ aMY_CXT);
+		debs("Leaving RUNOPS");
+		do_debstackinfo(aTHX_ aMY_CXT);
+		debf(" (%s:%d)\n", CopFILE_short(PL_curcop), (int)CopLINE(PL_curcop));
 	}
 
 	debflush();
@@ -739,14 +934,14 @@ BOOT:
 {
 	HV* const stash = gv_stashpvs(PACKAGE, TRUE);
 	MY_CXT_INIT;
+
 	MY_CXT.debugsv = get_sv(PACKAGE "::DB", GV_ADD);
 	if(!SvOK(MY_CXT.debugsv)){
 		sv_setiv(MY_CXT.debugsv, 0x00);
 	}
 
-	MY_CXT.log        = Perl_error_log;
-	MY_CXT.buff       = newSV(50);
-	MY_CXT.linebuf    = newSV(50);
+	MY_CXT.buff       = newSV(PV_LIMIT);
+	MY_CXT.linebuf    = newSV(PV_LIMIT);
 	MY_CXT.debsv_seen = newHV();
 
 	sv_setpvs(MY_CXT.linebuf, "");

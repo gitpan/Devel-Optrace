@@ -1,13 +1,24 @@
 #!perl -w
 use strict;
 
+use Tie::Scalar;
+use Tie::Array;
 use Devel::Optrace;
 
 my %h;
-$h{myself} = \%h;
-p(\%h);
+tie my @a, 'Tie::StdArray';
+p($h{foo});
+p($a[0]);
 
-p(\our @ISA);
-p(\%^H);
+tie $0, 'Tie::StdScalar';
+p($0);
 
-p(qr/foo/, 3.14);
+p(*p, \&p);
+
+p(qr/foo/xms);
+
+p($ENV{PATH});
+p(substr($ENV{PATH}, 0, 10));
+
+p(\@Tie::StdScalar::ISA);
+p \%strict::
