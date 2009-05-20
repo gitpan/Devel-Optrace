@@ -1,5 +1,9 @@
 Revision history for Perl extension Devel::Optrace
 
+0.04 Tue May 19 14:52:34 2009
+	- no Perl_find_run_cv() for Active Perls (RT#46149)
+	- make thread safe
+
 0.03 Mon May 18 14:28:36 2009
 	- implement remaining private flags (OPpXXX)
 	- fix some bugs

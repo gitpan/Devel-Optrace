@@ -462,11 +462,32 @@ do_stack(pTHX_ pMY_CXT){
 	debs(")\n");
 }
 
+/* stolen from Perl_do_runcv() in pp_ctl.c */
+static CV*
+do_find_runcv(pTHX){
+	PERL_SI *si;
+
+	for (si = PL_curstackinfo; si; si = si->si_prev) {
+		I32 ix;
+		for (ix = si->si_cxix; ix >= 0; ix--) {
+			PERL_CONTEXT* const cx = &(si->si_cxstack[ix]);
+			if (CxTYPE(cx) == CXt_SUB || CxTYPE(cx) == CXt_FORMAT) {
+				return cx->blk_sub.cv;
+			}
+			else if (CxTYPE(cx) == CXt_EVAL && !CxTRYBLOCK(cx)){
+				return PL_compcv;
+			}
+		}
+	}
+	return PL_main_cv;
+}
+
+
 #define debpadname(po) do_debpadname(aTHX_ aMY_CXT_ (po))
 static void
 do_debpadname(pTHX_ pMY_CXT_ PADOFFSET const targ){
 	dVAR;
-	CV* const cv = Perl_find_runcv(aTHX_ NULL);
+	CV* const cv = do_find_runcv(aTHX);
 	AV* const comppad_names = (AV*)AvARRAY(CvPADLIST(cv))[0];
 	SV* name;
 
@@ -553,6 +574,7 @@ do_optrace(pTHX_ pMY_CXT){
 		debs("(");
 		debgv(cGVOPo_gv, "$");
 		debs(")");
+		Private(OPpOUR_INTRO,  " OUR_INTRO");
 		goto intro_common;
 
 	case OP_RV2GV:
@@ -912,7 +934,7 @@ d_optrace_peep(pTHX_ OP* const o){
 }
 
 static void
-do_uninit_debugger(pTHX){
+do_init(pTHX_ pMY_CXT){
 	dVAR;
 
 #if 0
@@ -925,7 +947,17 @@ do_uninit_debugger(pTHX){
 	PL_DBsignal = NULL; /* $DB::signal */
 #endif
 
-	PL_perldb   = (PERLDBf_NAMEEVAL | PERLDBf_NAMEANON); /* $^P */
+	MY_CXT.debugsv    = get_sv(PACKAGE "::DB", GV_ADD);
+	MY_CXT.buff       = newSV(PV_LIMIT);
+	MY_CXT.linebuf    = newSV(PV_LIMIT);
+	MY_CXT.debsv_seen = newHV();
+
+	sv_setpvs(MY_CXT.linebuf, "");
+
+
+	if(PL_perldb){
+		PL_perldb   = (PERLDBf_NAMEEVAL | PERLDBf_NAMEANON); /* $^P */
+	}
 }
 
 MODULE = Devel::Optrace	PACKAGE = Devel::Optrace
@@ -935,23 +967,13 @@ BOOT:
 	HV* const stash = gv_stashpvs(PACKAGE, TRUE);
 	MY_CXT_INIT;
 
-	MY_CXT.debugsv = get_sv(PACKAGE "::DB", GV_ADD);
+	do_init(aTHX_ aMY_CXT);
 	if(!SvOK(MY_CXT.debugsv)){
 		sv_setiv(MY_CXT.debugsv, 0x00);
 	}
 
-	MY_CXT.buff       = newSV(PV_LIMIT);
-	MY_CXT.linebuf    = newSV(PV_LIMIT);
-	MY_CXT.debsv_seen = newHV();
-
-	sv_setpvs(MY_CXT.linebuf, "");
-
 	MY_CXT.orig_runops = PL_runops;
 	MY_CXT.orig_peepp  = PL_peepp;
-
-	if(PL_perldb){
-		do_uninit_debugger(aTHX);
-	}
 
 	newCONSTSUB(stash, "DOf_TRACE",   newSViv(DOf_TRACE));
 	newCONSTSUB(stash, "DOf_STACK",   newSViv(DOf_STACK));
@@ -959,7 +981,7 @@ BOOT:
 	newCONSTSUB(stash, "DOf_NOOPT",   newSViv(DOf_NOOPT));
 	newCONSTSUB(stash, "DOf_COUNT",   newSViv(DOf_COUNT));
 
-	newCONSTSUB(stash, "DOf_DEFAULT",     newSViv(DOf_DEFAULT));
+	newCONSTSUB(stash, "DOf_DEFAULT", newSViv(DOf_DEFAULT));
 
 	PL_runops = d_optrace_runops;
 	PL_peepp  = d_optrace_peep;
@@ -967,12 +989,26 @@ BOOT:
 
 PROTOTYPES: DISABLE
 
+#ifdef USE_ITHREADS
+
 void
-END()
+CLONE(...)
+CODE:
+{
+	MY_CXT_CLONE;
+	do_init(aTHX_ aMY_CXT);
+	PERL_UNUSED_VAR(items);
+}
+
+#endif
+
+void
+END(...)
 CODE:
 {
 	dMY_CXT;
 	do_debcount_dump(aTHX_ aMY_CXT);
+	PERL_UNUSED_VAR(items);
 }
 
 
