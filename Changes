@@ -1,5 +1,8 @@
 Revision history for Perl extension Devel::Optrace
 
+0.05 2013-09-12 00:04:07+0900
+    - Fix segvs
+
 0.04 Tue May 19 14:52:34 2009
 	- no Perl_find_run_cv() for Active Perls (RT#46149)
 	- make thread safe

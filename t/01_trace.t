@@ -9,7 +9,7 @@ open local(*STDERR), '>', \$buff;
 
 Devel::Optrace->enable();
 
-foreach my $mod qw(Math::BigInt Data::Dumper File::Copy CGI POSIX){
+foreach my $mod (qw(Math::BigInt Data::Dumper File::Copy CGI POSIX)) {
 	(my $file = "$mod.pm") =~ s{::}{/}g;
 
 	ok require $file, "require $mod";
